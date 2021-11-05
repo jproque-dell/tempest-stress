@@ -10,6 +10,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+from tempest.common import waiters
 from tempest import config
 from tempest.lib.common.utils import data_utils
 
@@ -23,13 +24,15 @@ class VolumeCreateDeleteTest(stressaction.StressAction):
     def run(self):
         name = data_utils.rand_name("volume")
         self.logger.info("creating %s" % name)
-        volumes_client = self.manager.volumes_client
+        volumes_client = self.manager.volumes_client_latest
         volume = volumes_client.create_volume(
             display_name=name, size=CONF.volume.volume_size)['volume']
         vol_id = volume['id']
-        volumes_client.wait_for_volume_status(vol_id, 'available')
+        waiters.wait_for_volume_resource_status(
+            volumes_client, vol_id, 'available')
         self.logger.info("created %s" % volume['id'])
         self.logger.info("deleting %s" % name)
         volumes_client.delete_volume(vol_id)
-        volumes_client.wait_for_resource_deletion(vol_id)
+        volumes_client.wait_for_resource_deletion(
+            vol_id)
         self.logger.info("deleted %s" % vol_id)

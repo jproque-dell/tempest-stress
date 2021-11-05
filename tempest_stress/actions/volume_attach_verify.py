@@ -39,8 +39,9 @@ class VolumeVerifyStress(stressaction.StressAction):
         servers_client = self.manager.servers_client
         self.logger.info("creating %s" % name)
         vm_args = self.vm_extra_args.copy()
-        vm_args['security_groups'] = [self.sec_grp]
+        vm_args['security_groups'] = [{"name":self.sec_grp['name']}]
         vm_args['key_name'] = self.key['name']
+        self.logger.info(vm_args)
         server = servers_client.create_server(name=name, imageRef=self.image,
                                               flavorRef=self.flavor,
                                               **vm_args)['server']
@@ -56,45 +57,46 @@ class VolumeVerifyStress(stressaction.StressAction):
         self.logger.info("deleted server: %s" % self.server_id)
 
     def _create_sec_group(self):
-        sec_grp_cli = self.manager.compute_security_groups_client
+        sec_grp_cli = self.manager.security_groups_client
+        sec_grp_rules_cli = self.manager.security_group_rules_client
         s_name = data_utils.rand_name(self.__class__.__name__ + '-sec_grp')
         s_description = data_utils.rand_name('desc')
         self.sec_grp = sec_grp_cli.create_security_group(
             name=s_name, description=s_description)['security_group']
-        create_rule = sec_grp_cli.create_security_group_rule
-        create_rule(parent_group_id=self.sec_grp['id'], ip_protocol='tcp',
-                    from_port=22, to_port=22)
-        create_rule(parent_group_id=self.sec_grp['id'], ip_protocol='icmp',
-                    from_port=-1, to_port=-1)
+        create_rule = sec_grp_rules_cli.create_security_group_rule
+        create_rule(security_group_id=self.sec_grp['id'], protocol='tcp',
+                    direction='ingress', port_range_min=22, port_range_max=22)
+        create_rule(security_group_id=self.sec_grp['id'], protocol='icmp',
+                    direction='ingress',port_range_min=0, port_range_max=0)
 
     def _destroy_sec_grp(self):
         sec_grp_cli = self.manager.compute_security_groups_client
         sec_grp_cli.delete_security_group(self.sec_grp['id'])
 
     def _create_floating_ip(self):
-        floating_cli = self.manager.compute_floating_ips_client
-        self.floating = (floating_cli.create_floating_ip(self.floating_pool)
-                         ['floating_ip'])
+        floating_cli = self.manager.floating_ips_client
+        self.floating = floating_cli.create_floatingip(floating_network_id=self.floating_network)['floatingip']
 
     def _destroy_floating_ip(self):
         cli = self.manager.compute_floating_ips_client
         cli.delete_floating_ip(self.floating['id'])
         cli.wait_for_resource_deletion(self.floating['id'])
-        self.logger.info("Deleted Floating IP %s", str(self.floating['ip']))
+        self.logger.info("Deleted Floating IP %s", str(self.floating['floating_ip_address']))
 
     def _create_volume(self):
         name = data_utils.rand_name(self.__class__.__name__ + "-volume")
         self.logger.info("creating volume: %s" % name)
-        volumes_client = self.manager.volumes_client
+        volumes_client = self.manager.volumes_client_latest
         self.volume = volumes_client.create_volume(
             display_name=name, size=CONF.volume.volume_size)['volume']
-        volumes_client.wait_for_volume_status(self.volume['id'],
-                                              'available')
+        waiters.wait_for_volume_resource_status(volumes_client,
+                                                self.volume['id'],
+                                                'available')
         self.logger.info("created volume: %s" % self.volume['id'])
 
     def _delete_volume(self):
         self.logger.info("deleting volume: %s" % self.volume['id'])
-        volumes_client = self.manager.volumes_client
+        volumes_client = self.manager.volumes_client_latest
         volumes_client.delete_volume(self.volume['id'])
         volumes_client.wait_for_resource_deletion(self.volume['id'])
         self.logger.info("deleted volume: %s" % self.volume['id'])
@@ -114,7 +116,8 @@ class VolumeVerifyStress(stressaction.StressAction):
     def new_server_ops(self):
         self._create_vm()
         cli = self.manager.compute_floating_ips_client
-        cli.associate_floating_ip_to_server(self.floating['ip'],
+
+        cli.associate_floating_ip_to_server(self.floating['floating_ip_address'],
                                             self.server_id)
         if self.ssh_test_before_attach and self.enable_ssh_verify:
             self.logger.info("Scanning for block devices via ssh on %s"
@@ -148,7 +151,7 @@ class VolumeVerifyStress(stressaction.StressAction):
         self.image = CONF.compute.image_ref
         self.flavor = CONF.compute.flavor_ref
         self.vm_extra_args = kwargs.get('vm_extra_args', {})
-        self.floating_pool = kwargs.get('floating_pool', None)
+        self.floating_network = CONF.network.public_network_id
         self.new_volume = kwargs.get('new_volume', True)
         self.new_server = kwargs.get('new_server', False)
         self.enable_ssh_verify = kwargs.get('enable_ssh_verify', True)
@@ -164,7 +167,7 @@ class VolumeVerifyStress(stressaction.StressAction):
         self._create_keypair()
         private_key = self.key['private_key']
         username = CONF.validation.image_ssh_user
-        self.remote_client = remote_client.RemoteClient(self.floating['ip'],
+        self.remote_client = remote_client.RemoteClient(self.floating['floating_ip_address'],
                                                         username,
                                                         pkey=private_key)
         if not self.new_volume:
@@ -175,9 +178,10 @@ class VolumeVerifyStress(stressaction.StressAction):
     # now we just test that the number of partitions has increased or decreased
     def part_wait(self, num_match):
         def _part_state():
-            self.partitions = self.remote_client.get_partitions().split('\n')
+            self.partitions = self.remote_client.list_disks()
+            self.logger.info(self.partitions)
             matching = 0
-            for part_line in self.partitions[1:]:
+            for part_line in self.partitions:
                 if self.part_line_re.match(part_line):
                     matching += 1
             return matching == num_match
@@ -195,13 +199,15 @@ class VolumeVerifyStress(stressaction.StressAction):
         if self.new_volume:
             self._create_volume()
         servers_client = self.manager.servers_client
+        volumes_client = self.manager.volumes_client_latest
         self.logger.info("attach volume (%s) to vm %s" %
                          (self.volume['id'], self.server_id))
         servers_client.attach_volume(self.server_id,
                                      volumeId=self.volume['id'],
                                      device=self.part_name)
-        self.manager.volumes_client.wait_for_volume_status(self.volume['id'],
-                                                           'in-use')
+        waiters.wait_for_volume_resource_status(volumes_client,
+                                                self.volume['id'],
+                                                'in-use')
         if self.enable_ssh_verify:
             self.logger.info("Scanning for new block device on %s"
                              % self.server_id)
@@ -209,8 +215,9 @@ class VolumeVerifyStress(stressaction.StressAction):
 
         servers_client.detach_volume(self.server_id,
                                      self.volume['id'])
-        self.manager.volumes_client.wait_for_volume_status(self.volume['id'],
-                                                           'available')
+        waiters.wait_for_volume_resource_status(volumes_client,
+                                                self.volume['id'],
+                                                'available')
         if self.enable_ssh_verify:
             self.logger.info("Scanning for block device disappearance on %s"
                              % self.server_id)
@@ -222,7 +229,8 @@ class VolumeVerifyStress(stressaction.StressAction):
 
     def tearDown(self):
         cli = self.manager.compute_floating_ips_client
-        cli.disassociate_floating_ip_from_server(self.floating['ip'],
+        self.logger.info(self.floating)
+        cli.disassociate_floating_ip_from_server(self.floating['floating_ip_address'],
                                                  self.server_id)
         self._wait_disassociate()
         if not self.new_server:

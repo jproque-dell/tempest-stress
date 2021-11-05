@@ -15,6 +15,7 @@
 from tempest.common import waiters
 from tempest import config
 from tempest.lib.common.utils import data_utils
+from tempest.scenario import manager
 
 import tempest_stress.stressaction as stressaction
 
@@ -32,6 +33,7 @@ class ServerCreateDestroyTest(stressaction.StressAction):
         self.logger.info("creating %s" % name)
         server = self.manager.servers_client.create_server(
             name=name, imageRef=self.image, flavorRef=self.flavor)['server']
+        self.logger.debug(server)
         server_id = server['id']
         waiters.wait_for_server_status(self.manager.servers_client, server_id,
                                        'ACTIVE')
